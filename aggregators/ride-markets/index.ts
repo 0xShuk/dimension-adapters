@@ -2,7 +2,7 @@ import { Dependencies, FetchOptions, SimpleAdapter } from "../../adapters/types"
 import { CHAIN } from "../../helpers/chains";
 import { queryAllium } from "../../helpers/allium";
 
-// Ride executes trade intents on behalf of DAO treasuries on Solana. Every fill is an
+// Ride Markets executes trade intents on behalf of DAO treasuries on Solana. Every fill is an
 // `execute_intent` outer instruction on the Ride program, which CPIs into an underlying
 // router (Jupiter, DFlow) to perform the actual swap.
 const RIDE_PROGRAM = "tRADeQ3SJVHnFXv1rpwZzVt5HE6DWDu4J6cH34Md6ZA";

@@ -3,13 +3,12 @@ import { Dependencies, FetchOptions, SimpleAdapter } from "../../adapters/types"
 import { CHAIN } from "../../helpers/chains";
 import { queryAllium } from "../../helpers/allium";
 
-// Ride executes trade intents on behalf of DAO treasuries on Solana. Fees are charged when a
-// trade settles (`execute_intent` for spot, `perp_finalize` for Phoenix perps), inside the same
-// instruction that pays the treasury out.
+// On Ride Markets, the callers choose coin, duration, direction (up/down) and place a trade from treasury. 
+// Each trade is executed through our Trade Executor program. Fees are charged when a
+// trade settles: `execute_intent` ix for spot and `perp_finalize` ix for Phoenix perps.
 const RIDE_PROGRAM = "tRADeQ3SJVHnFXv1rpwZzVt5HE6DWDu4J6cH34Md6ZA";
 
-// Protocol fee wallet, in USDC only - the program validates the destination token account against
-// this wallet's USDC account before every settlement fee transfer. It also receives the flat
+// Protocol fee wallet, in USDC only - in addition to the swap and profit fees, it also receives the flat
 // intent-opening fee, which the app sends as a plain transfer rather than through the program.
 // https://solscan.io/account/ejBYopijneorWAQ1rN6FiZMvmfXbcjcz4mELCNMRsPW
 const FEE_TAKER = "ejBYopijneorWAQ1rN6FiZMvmfXbcjcz4mELCNMRsPW";
@@ -18,6 +17,9 @@ const FEE_TAKER = "ejBYopijneorWAQ1rN6FiZMvmfXbcjcz4mELCNMRsPW";
 const SWAP_FEE_BPS = 70; // 0.7% of the treasury's gross USDC return
 const NORMAL_CLOSE_FEE_BPS = 100; // 1% of the caller's gross profit share
 const EARLY_CLOSE_FEE_BPS = 1000; // 10% instead, when the close lands inside the early window
+// const INTENT_OPENING_FEE = 0.1/1; // The fourth avenue of fees is the intent-opening fees 
+// which is a plain SPL transfer of either 0.1 USDC or 1 USDC depending on the number of trades placed 
+// in a single ride
 
 // Ratio of the caller's net payout to the profit fee, for each close type:
 // payout = gross - fee = fee * (10000 - bps) / bps.
@@ -42,20 +44,15 @@ const grossFromNet = (net: number): number => {
   return approx;
 };
 
-// A settlement pays USDC out of the intent vault to the treasury, to the fee wallet, and - when
-// the trade closed a linked position - to the caller. The fee wallet's transfer is the swap fee
-// and the profit fee combined, and the treasury and the caller are just two addresses we cannot
-// tell apart on their own.
+// A settlement sends USDC out of the intent vault to the treasury, to the fee wallet, and - when
+// the trade closed with profits - to the caller. The fee wallet's transfer is the swap fee
+// and the profit fee combined.
 //
-// They are separable arithmetically: treating a candidate as the treasury fixes the swap fee
-// (above) and therefore the profit fee, and the caller's payout must then be exactly 9x (early
-// close) or 99x (normal close) that profit fee. Only the correct assignment satisfies both, so
-// this identifies the treasury without needing to know which DAOs trade on Ride.
+// The caller's payout must then be exactly 9x (early close) or 99x (normal close) that profit fee.
 const splitFees = (feeTotal: number, payouts: Payout[]): Split | null => {
   if (feeTotal <= 0 || !payouts.length) return null;
-  // A settlement that closed no linked position pays only the treasury, so the whole fee is the
-  // swap fee - and the treasury's net has to reproduce it. If it does not, the transfer set holds
-  // something this does not model, so fall through to the unsplit bucket rather than guess.
+  // A settlement that closed with no profits pays only the treasury, so the whole fee is the
+  // swap fee.
   if (payouts.length === 1) {
     const derived = grossFromNet(payouts[0].amount) - payouts[0].amount;
     return Math.abs(derived - feeTotal) <= 2 ? { swap: feeTotal, profit: 0, early: false, caller: 0 } : null;
@@ -88,10 +85,6 @@ const fetch = async (options: FetchOptions) => {
   const timeRange = `block_timestamp >= TO_TIMESTAMP_NTZ(${options.startTimestamp})
         AND block_timestamp < TO_TIMESTAMP_NTZ(${options.endTimestamp})`;
 
-  // `outer_program_id` scopes both legs to transfers made from inside a Ride instruction, so a
-  // plain transfer into the fee wallet - even one bundled into the same transaction - cannot
-  // inflate fees. Each settlement is keyed by its vault authority, so a transaction carrying two
-  // settlements stays split.
   const query = `
     WITH fee_legs AS (
       SELECT txn_id, from_address AS vault, SUM(raw_amount) AS fee_total
@@ -122,11 +115,6 @@ const fetch = async (options: FetchOptions) => {
       ON p.txn_id = f.txn_id AND p.vault = f.vault
   `;
 
-  // Everything the fee wallet takes in. The settlement fees above are the part paid from inside a
-  // Ride instruction; the remainder is the flat fee charged to open an intent, which the app sends
-  // as a plain transfer alongside the (governance-CPI'd) `create_intent`, so it carries no Ride
-  // outer instruction to key off. Taking it as a remainder keeps reported revenue equal to what the
-  // wallet actually received.
   const inflowQuery = `
     SELECT SUM(raw_amount) AS amount
     FROM solana.assets.transfers
@@ -152,8 +140,7 @@ const fetch = async (options: FetchOptions) => {
     settlementFees += feeTotal;
     const split = splitFees(feeTotal, payouts);
     if (!split) {
-      // Keeps the reported total equal to what the fee wallet actually received even when the
-      // split does not resolve (e.g. an executor tip paid in USDC alongside the payouts).
+      // In case the split doesn't resolve, for old intents transactions
       dailyFees.add(usdc, feeTotal, "Unsplit Settlement Fees");
       dailyRevenue.add(usdc, feeTotal, "Unsplit Settlement Fees To Protocol");
       return;
@@ -187,11 +174,11 @@ const fetch = async (options: FetchOptions) => {
 };
 
 const methodology = {
-  Fees: "Everything paid to trade through Ride: a flat fee to open an intent, a 0.7% swap fee on the USDC returned to the treasury when it settles, a fee on the closing caller's profit share (1% normally, 10% inside the early-close window), and the caller's profit share itself. Read from USDC received by the Ride fee wallet, with the settlement fees resolved per trade from the transfers made inside `execute_intent` and `perp_finalize`.",
-  UserFees: "Same as Fees - charged to the DAO treasury being traded for, or to the user opening the intent.",
+  Fees: "Everything paid to trade through Ride: a flat fee to open an intent, a swap fee on treasury deployment and a fee on the closing caller's profit share",
+  UserFees: "Same as Fees - charged to the funds (treasuries) being traded for, or to the user opening the intent.",
   Revenue: "The intent-opening fee, the swap fee and the profit-share fee, all of which are paid to the Ride fee wallet.",
   ProtocolRevenue: "Same as Revenue - the fee wallet is a protocol-controlled account.",
-  SupplySideRevenue: "The caller's profit share, paid out of the treasury's realised profit to the creator of the bet that the trade closed.",
+  SupplySideRevenue: "The caller's profit share, paid out of the treasury's realised profit to the creator of the trade.",
 };
 
 const breakdownMethodology = {
